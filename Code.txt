@@ -1,0 +1,235 @@
+Data preprocessing
+
+# Setting up databases, software and working directories
+    soft=/anaconda3/
+    db=/db
+    wd=~/meta
+
+    # Adding an analysis environment 
+    ~/.bashrc
+    PATH=$db/EasyMicrobiome/linux:$db/EasyMicrobiome/script:$PATH
+    # Create and enter a working directory    
+    mkdir -p $wd && cd $wd
+
+###Starting files - sequences and metadata
+   mkdir -p seq temp result
+
+##1.Assemble
+   flye --nano-raw /data/analysis/A.fastq.gz -o /data/analysis/B -t 8 --meta
+
+##2.Racon rectify
+
+##2.1First round
+    minimap2 -t 10 sample5.fasta /data/analysis/A.fastq.gz > round1.paf
+    racon -t 16 /data/analysis/A.fastq.gz round1.paf B.fasta > racon_round1.fasta&
+
+##2.2 Second round
+    minimap2 -t 8 racon_round1.fasta /data/analysis/A.fastq.gz> round2.paf
+    racon -t 8 /data/analysis/A.fastq.gz round2.paf racon_round1.fasta > racon_round2.fasta&
+
+##2.3 Third round
+    minimap2 -t 8 racon_round2.fasta /data/analysis/A.fastq.gz> round3.paf
+    racon -t 8 /data/analysis/A.fastq.gz round3.paf racon_round2.fasta > racon_round3.fasta&
+
+##3.Prodigal prediction
+    prodigal -p meta -i A.racon_round3.fasta -d sample5.predict.nt.fa -a A.predict.aa.fa -f gff -o A.predict.gff
+
+## 4 Gene prediction, cluster & quantitfy
+
+## 4.1 metaProdigal
+    
+    mkdir -p temp/prodigal
+    # prodigal meta predictie gene 
+    prodigal -i result/megahit/final.contigs.fa \
+        -d temp/prodigal/gene.fa \
+        -o temp/prodigal/gene.gff \
+        -p meta -f gff > temp/prodigal/gene.log 2>&1 
+    tail temp/prodigal/gene.log
+    # Number of genes counted 
+    seqkit stat temp/prodigal/gene.fa 
+    # Count the number of complete genes
+    grep -c 'partial=00' temp/prodigal/gene.fa 
+    # Extraction of complete genes
+    grep 'partial=00' temp/prodigal/gene.fa | cut -f1 -d ' '| sed 's/>//' > temp/prodigal/full_length.id
+    seqkit grep -f temp/prodigal/full_length.id temp/prodigal/gene.fa > temp/prodigal/full_length.fa
+    seqkit stat temp/prodigal/full_length.fa
+
+## 4.2 Gene De-redundancy cd-hit
+
+    # input：temp/prodigal/gene.fa
+    # output：result/NR/nucleotide.fa, result/NR/protein.fa
+    
+    mkdir -p result/NR
+    cd-hit-est -i /data/seqs.nt.fa -o /data/nucleotide.fa -aS 0.9 -c 0.95 -G 0 -g 0 -T 0 -M 0
+    
+    cd-hit-est -i temp/prodigal/gene.fa \
+    -o result/NR/nucleotide.fa \
+    -aS 0.9 -c 0.95 -G 0 -g 0 -T 0 -M 0       
+        
+    # Counting the number of non-redundant genes
+    grep -c '>' result/NR/nucleotide.fa
+    seqkit translate --trim /data/nucleotide.fa > /data/protein.fa 
+      seqkit translate --trim result/NR/nucleotide.fa \
+        > result/NR/protein.fa 
+
+## 4.3 Gene Quantification Salmon
+    
+    mkdir -p temp/salmon
+
+    salmon index \
+      -t result/NR/nucleotide.fa \
+      -p 9 \
+      -i temp/salmon/index 
+salmon index -t /data/nucleotide.fa -p 9 -i /data/salmon/index 
+    
+    tail -n+2 result/metadata.txt|cut -f1|rush -j 2 \
+      "salmon quant \
+        -i temp/salmon/index -l A -p 3 --meta \
+        -1 temp/qc/{1}_1.fastq \
+        -2 temp/qc/{1}_2.fastq \
+        -o temp/salmon/{1}.quant"
+for i in `ls *fastq.gz`
+do
+new=`echo $i|sed 's/.fastq.gz//'`
+nohup salmon quant -i /data/salmon/index -l A -p 3 --meta -r /data/${i} -o /data/salmon/${new}.quant&
+done
+    # Combination
+    mkdir -p result/salmon
+    salmon quantmerge --quants temp/salmon/*.quant \
+        -o result/salmon/gene.TPM
+    salmon quantmerge --quants temp/salmon/*.quant \
+        --column NumReads -o result/salmon/gene.count
+    sed -i '1 s/.quant//g' result/salmon/gene.*
+
+salmon quantmerge --quants /salmon/*.quant -o /data/salmon/gene.TPM
+salmon quantmerge --quants /salmon/*.quant --column NumReads -o /data/salmon/gene.count
+sed -i '1 s/.quant//g' /data/salmon/gene.*
+  
+    # Preview results table
+    head -n3 result/salmon/gene.*
+
+## 5 Functional gene annotation
+
+## 5.1 eggNOG(COG/KEGG/CAZy)
+
+    # https://github.com/eggnogdb/eggnog-mapper/wiki/eggNOG-mapper-v2
+    
+    conda activate eggnog
+    emapper.py --version # 2.1.7
+
+    # Diamond aligns genes to eggNOG 5.0 database
+    mkdir -p temp/eggnog
+    time emapper.py \
+      --data_dir ${db}/eggnog \
+      -i result/NR/protein.fa \
+      --cpu 3 -m diamond --override \
+      # --resume \
+      -o temp/eggnog/output
+ nohup emapper.py --data_dir ${db}/eggnog -i /data/protein.fa --cpu 3 -m diamond --override -o /data/eggnog/output &
+
+    # Comparison Results Functional Notes
+    # emapper.py \
+    #  --annotate_hits_table temp/eggnog/protein.emapper.seed_orthologs \
+    #  --data_dir ${db}/eggnog \
+    #  --cpu 9 --no_file_comments --override \
+    #  -o temp/eggnog/output
+    head temp/eggnog/output.emapper.annotations
+   
+    grep -v '^##' temp/eggnog/output.emapper.annotations | sed '1 s/^#//' \
+      > temp/eggnog/output
+    grep -v '^##' /data/eggnog/output.emapper.annotations | sed '1 s/^#//' > /data/eggnog/output
+    csvtk -t headers -v temp/eggnog/output
+
+    ## summarizeAbundance
+    mkdir -p result/eggnog
+    summarizeAbundance.py \
+      -i result/salmon/gene.TPM \
+      -m temp/eggnog/output \
+      -c '7,12,19' -s '*+,+,' -n raw \
+      -o result/eggnog/eggnog
+  
+summarizeAbundance.py -i /data/salmon/filter_gene.TPM1.xls -m /data/eggnog/filter_eggnog.xls -c '7,12,19' -s '*+,+,' -n raw -o /data/eggnog/eggnog 
+  
+    sed -i 's#^ko:##' result/eggnog/eggnog.KEGG_ko.raw.txt
+    # sed -i 's/^ko://' result/eggnog/eggnog.KEGG_ko.raw.txt
+    sed -i '/^-/d' result/eggnog/eggnog*
+    # eggnog.CAZy.raw.txt  eggnog.COG_category.raw.txt  eggnog.KEGG_ko.raw.txt
+    
+    awk 'BEGIN{FS=OFS="\t"} NR==FNR{a[$1]=$2} NR>FNR{print a[$1],$0}' \
+      /db/EasyMicrobiome/kegg/KO_description.txt \
+      result/eggnog/eggnog.KEGG_ko.raw.txt | \
+      sed 's/^\t/Unannotated\t/' \
+      > result/eggnog/eggnog.KEGG_ko.TPM.spf
+    head -n 5 result/eggnog/eggnog.KEGG_ko.TPM.spf
+    # KO to level 1/2/3
+    summarizeAbundance.py \
+      -i result/eggnog/eggnog.KEGG_ko.raw.txt \
+      -m /db/EasyMicrobiome/kegg/KO1-4.txt \
+      -c 2,3,4 -s ',+,+,' -n raw \
+      -o result/eggnog/KEGG
+    
+    head -n 5 result/eggnog/KEGG.PathwayL1.raw.txt
+     
+## 5.2 CAZy
+    awk 'BEGIN{FS=OFS="\t"} NR==FNR{a[$1]=$2} NR>FNR{print a[$1],$0}' \
+       /db/EasyMicrobiome/dbcan2/CAZy_description.txt result/eggnog/eggnog.CAZy.raw.txt | \
+      sed 's/^\t/Unannotated\t/' > result/eggnog/eggnog.CAZy.TPM.spf
+    
+## 5.3 COG
+    awk 'BEGIN{FS=OFS="\t"} NR==FNR{a[$1]=$2"\t"$3} NR>FNR{print a[$1],$0}' \
+      /db/EasyMicrobiome/eggnog/COG.anno result/eggnog/eggnog.COG_category.raw.txt > \
+      result/eggnog/eggnog.COG_category.TPM.spf
+
+## 5.4 CARD
+
+    conda activate rgi
+    rgi -h | grep '^Resistance Gene Identifier' # 5.2.1
+
+    mkdir -p result/card
+    cut -f 1 -d ' ' result/NR/protein.fa > temp/protein.fa
+    
+    grep '>' result/NR/protein.fa | head -n 3
+    grep '>' temp/protein.fa | head -n 3
+    
+    rgi main -i temp/protein.fa -t protein \
+      -n 9 -a DIAMOND --include_loose --clean \
+      -o result/card/protein
+    head result/card/protein.txt
+    
+    cut -f 1 -d ' ' result/NR/nucleotide.fa > temp/nucleotide.fa
+    head temp/nucleotide.fa
+    rgi main -i temp/nucleotide.fa -t contig \
+      -n 9 -a DIAMOND --include_loose --clean \
+      -o result/card/nucleotide
+    
+    head result/card/nucleotide.txt
+
+## 5.5 VFDB
+   blastp -query /data/protein.fa -db /data/VFDB \
+   -evalue 1e-10 -outfmt 5 \
+   -out /data/VFDB/protein.blastp.xml
+   
+    perl alignxml2tab.pl -tophit 1 -topmatch 1 protein.blastp.xml >VFDB.blast.xls
+
+## 5.6 PHI
+   blastp -query /data/protein.fa -db /data/PHI \
+   -evalue 1e-10 -outfmt 5 \
+   -out /data/PHI/protein.blastp.xml
+   
+   perl alignxml2tab.pl -tophit 1 -topmatch 1 protein.blastp.xml >PHI.blast.xls
+
+## 6 Bacteria Taxonomy
+## uhgg
+   /anaconda3/envs/eggnog/bin/diamond  blastp -q /data/protein.fa \
+   -d /data/uhgg_database/protein/uhgp-100/uhgppro -p 10 -k 10 \
+   --more-sensitive --salltitles --outfmt 5 -e 1e-10 \
+    -o /data/blastp_uhgp/protein.blastp.xml
+
+   perl alignxml2tab.pl -tophit 1 -topmatch 1 protein.blastp.xml >micro.blast.xls
+
+## nr_micro
+     /anaconda3/envs/eggnog/bin/diamond  blastp -q /data/protein.fa \
+    -d /data/meta/nr_micro -p 10 -k 10 --more-sensitive --salltitles --outfmt 5 -e 1e-10 \
+    -o /data/blastp_nr_micro/protein.blastp.xml
+
+perl alignxml2tab.pl -tophit 1 -topmatch 1 protein.blastp.xml >micro.nr.blast.xls
